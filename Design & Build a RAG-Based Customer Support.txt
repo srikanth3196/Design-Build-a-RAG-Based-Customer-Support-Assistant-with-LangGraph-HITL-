@@ -1,0 +1,133 @@
+groq api key
+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
+
+
+
+
+!pip install langchain langchain-community chromadb pypdf langgraph groq sentence-transformers
+
+
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Chroma
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.prompts import PromptTemplate
+
+from langgraph.graph import StateGraph, END
+from typing import TypedDict
+
+from groq import Groq
+import os
+
+
+# Set Groq API Key
+os.environ["GROQ_API_KEY"] = "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"
+client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+
+# Load PDF
+loader = PyPDFLoader("sample.pdf")
+documents = loader.load()
+
+# Chunking
+splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
+chunks = splitter.split_documents(documents)
+
+# Embeddings + Vector DB
+embedding_model = HuggingFaceEmbeddings()
+
+vectordb = Chroma.from_documents(
+    documents=chunks,
+    embedding=embedding_model,
+    persist_directory="./chroma_db"
+)
+
+retriever = vectordb.as_retriever(search_kwargs={"k": 3})
+
+# Prompt
+prompt = PromptTemplate(
+    input_variables=["context", "question"],
+    template="""
+You are a helpful customer support assistant.
+Use ONLY the context below.
+
+Context:
+{context}
+
+Question:
+{question}
+
+If unsure, say you don't know.
+"""
+)
+
+class GraphState(TypedDict):
+    query: str
+    context: str
+    answer: str
+    confidence: float
+    escalate: bool
+
+def retrieve(state):
+    docs = retriever.get_relevant_documents(state["query"])
+    context = " ".join([d.page_content for d in docs])
+    return {"context": context}
+
+def generate(state):
+    final_prompt = prompt.format(context=state["context"], question=state["query"])
+
+    response = client.chat.completions.create(
+        model="llama3-70b-8192",
+        messages=[{"role": "user", "content": final_prompt}]
+    )
+
+    answer = response.choices[0].message.content
+    confidence = 0.9 if state["context"] else 0.3
+
+    return {"answer": answer, "confidence": confidence}
+
+def decide(state):
+    return {"escalate": state["confidence"] < 0.75}
+
+def human_escalation(state):
+    print("Escalating to human...")
+    human_response = input("Human response: ")
+    return {"answer": human_response}
+
+workflow = StateGraph(GraphState)
+
+workflow.add_node("retrieve", retrieve)
+workflow.add_node("generate", generate)
+workflow.add_node("decide", decide)
+workflow.add_node("human", human_escalation)
+
+workflow.set_entry_point("retrieve")
+
+workflow.add_edge("retrieve", "generate")
+workflow.add_edge("generate", "decide")
+
+workflow.add_conditional_edges(
+    "decide",
+    lambda s: "human" if s["escalate"] else END
+)
+
+workflow.add_edge("human", END)
+
+app = workflow.compile()
+
+query = input("Enter your query: ")
+result = app.invoke({"query": query})
+
+print("\nFinal Answer:")
+print(result["answer"])
+
+Enter your query: Can I get a refund after 6 months?
+
+DEBUG → Scores: [1.7713977098464966, 1.7713977098464966, 1.8059463500976562]
+DEBUG → Confidence: 0.29
+
+ Escalating to human agent...
+Human response: Refunds are only allowed within 30 days. Please contact support for exceptions
+
+✅ Final Answer:
+Refunds are only allowed within 30 days. Please contact support for exceptions
